@@ -25,7 +25,7 @@ use std::{
 
 use crate::{app::LayoutData, cli};
 
-type SplitsHistory = BTreeMap<Arc<str>, BTreeMap<Arc<str>, BTreeSet<Arc<Path>>>>;
+pub type SplitsHistory = BTreeMap<Arc<str>, BTreeMap<Arc<str>, BTreeSet<Arc<Path>>>>;
 
 #[derive(Default, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -405,8 +405,10 @@ impl Config {
             }
         }
 
+        // The splits are open at this point, so an auto splitter that fails to
+        // load is reported without failing the whole operation.
         #[cfg(feature = "auto-splitting")]
-        self.load_auto_splitter(auto_splitter, shared_timer)?;
+        or_show_error(self.load_auto_splitter(auto_splitter, shared_timer));
 
         Ok(())
     }
@@ -639,7 +641,24 @@ fn default_run() -> Run {
 }
 
 pub fn show_error(error: anyhow::Error) {
+    use gtk::prelude::*;
+
     log::error!("{error:?}");
+    let detail = error
+        .chain()
+        .skip(1)
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let dialog = gtk::AlertDialog::builder()
+        .message(error.to_string())
+        .detail(detail)
+        .modal(true)
+        .build();
+    let parent = gio::Application::default()
+        .and_downcast::<gtk::Application>()
+        .and_then(|application| application.active_window());
+    dialog.show(parent.as_ref());
 }
 
 pub fn or_show_error(result: Result<()>) {
@@ -653,7 +672,9 @@ mod tests {
     use super::{Config, LegacyAutoSplitterAssociation};
     #[cfg(feature = "auto-splitting")]
     use livesplit_core::{run::parser::composite, Run, StoredAutoSplitterSettings};
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
+    #[cfg(feature = "auto-splitting")]
+    use std::path::PathBuf;
 
     const LEGACY_CONFIG: &str = r#"
 splits:

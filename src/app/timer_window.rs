@@ -4,7 +4,7 @@ pub(super) fn install_timer_interactions(
     window: &gtk::ApplicationWindow,
     picture: &gtk::Picture,
     timer: &SharedTimer,
-    config: &Config,
+    config: &Rc<RefCell<Config>>,
     platform: Platform,
     sender: &ComponentSender<AppModel>,
 ) {
@@ -71,35 +71,19 @@ pub(super) fn install_timer_interactions(
     splits_files.append(Some("New"), Some("win.new-splits"));
     splits_files.append(Some("Open…"), Some("win.open-splits"));
     let recent = gio::Menu::new();
-    let mut recent_count = 0;
-    for (game_index, (game, categories)) in config.splits_history().iter().enumerate() {
-        let game_menu = gio::Menu::new();
-        for (category_index, (category, paths)) in categories.iter().enumerate() {
-            let category_menu = gio::Menu::new();
-            for (path_index, path) in paths.iter().enumerate() {
-                let action_name = format!("recent-{game_index}-{category_index}-{path_index}");
-                let label = path
-                    .file_name()
-                    .map_or_else(|| "Untitled".into(), |name| name.to_string_lossy());
-                category_menu.append(Some(&label), Some(&format!("win.{action_name}")));
-                let action = gio::SimpleAction::new(&action_name, None);
-                let path = path.to_path_buf();
-                let action_sender = sender.clone();
-                action.connect_activate(move |_, _| {
-                    action_sender.input(AppMsg::RequestAction(PendingAction::OpenSplits(
-                        path.clone(),
-                    )));
-                });
-                window.add_action(&action);
-                recent_count += 1;
-            }
-            game_menu.append_submenu(Some(category), &category_menu);
-        }
-        recent.append_submenu(Some(game), &game_menu);
-    }
-    if recent_count == 0 {
-        recent.append(Some("No recent splits available"), Some("win.open-recent"));
-    }
+    let open_recent_file =
+        gio::SimpleAction::new("open-recent-file", Some(&Vec::<u8>::static_variant_type()));
+    let recent_sender = sender.clone();
+    open_recent_file.connect_activate(move |_, parameter| {
+        use std::os::unix::ffi::OsStringExt;
+
+        let Some(path) = parameter.and_then(|value| value.get::<Vec<u8>>()) else {
+            return;
+        };
+        let path = PathBuf::from(std::ffi::OsString::from_vec(path));
+        recent_sender.input(AppMsg::RequestAction(PendingAction::OpenSplits(path)));
+    });
+    window.add_action(&open_recent_file);
     splits_files.append_submenu(Some("Open Recent"), &recent);
     splits_files.append(Some("Save"), Some("win.save-splits"));
     splits_files.append(Some("Save As…"), Some("win.save-splits-as"));
@@ -130,18 +114,11 @@ pub(super) fn install_timer_interactions(
     menu.append_submenu(Some("Control"), &control);
 
     let comparisons = gio::Menu::new();
-    let timer_guard = timer.read().unwrap();
-    for comparison in timer_guard.run().comparisons() {
-        let item = gio::MenuItem::new(Some(comparison), None);
-        item.set_action_and_target_value(Some("win.comparison"), Some(&comparison.to_variant()));
-        comparisons.append_item(&item);
-    }
     let comparison_action = gio::SimpleAction::new_stateful(
         "comparison",
         Some(&String::static_variant_type()),
-        &timer_guard.current_comparison().to_variant(),
+        &timer.read().unwrap().current_comparison().to_variant(),
     );
-    drop(timer_guard);
     let comparison_sender = sender.clone();
     comparison_action.connect_activate(move |action, parameter| {
         let Some(comparison) = parameter.and_then(|value| value.get::<String>()) else {
@@ -229,7 +206,7 @@ pub(super) fn install_timer_interactions(
         ("show-notes", EditorKind::NotesViewer),
     ] {
         let action = gio::SimpleAction::new(name, None);
-        action.set_enabled(config.splits_path().is_some());
+        action.set_enabled(config.borrow().splits_path().is_some());
         let action_sender = sender.clone();
         action.connect_activate(move |_, _| {
             action_sender.input(AppMsg::OpenEditor(kind));
@@ -297,12 +274,66 @@ pub(super) fn install_timer_interactions(
     popover.set_has_arrow(false);
     let click = gtk::GestureClick::new();
     click.set_button(3);
+    let menu_timer = timer.clone();
+    let menu_config = config.clone();
     click.connect_pressed(move |gesture, _, x, y| {
+        // The splits, their comparisons and the history change while the
+        // timer is open, so these are rebuilt whenever the menu is shown.
+        fill_recent_menu(&recent, menu_config.borrow().splits_history());
+        let timer = menu_timer.read().unwrap();
+        fill_comparison_menu(&comparisons, timer.run().comparisons());
+        comparison_action.set_state(&timer.current_comparison().to_variant());
+        timing_action.set_state(
+            &if timer.current_timing_method() == livesplit_core::TimingMethod::RealTime {
+                "real-time"
+            } else {
+                "game-time"
+            }
+            .to_variant(),
+        );
+        drop(timer);
         popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
         popover.popup();
         gesture.set_state(gtk::EventSequenceState::Claimed);
     });
     picture.add_controller(click);
+}
+
+fn fill_recent_menu(recent: &gio::Menu, history: &crate::config::SplitsHistory) {
+    use std::os::unix::ffi::OsStrExt;
+
+    recent.remove_all();
+    for (game, categories) in history {
+        let game_menu = gio::Menu::new();
+        for (category, paths) in categories {
+            let category_menu = gio::Menu::new();
+            for path in paths {
+                let label = path
+                    .file_name()
+                    .map_or_else(|| "Untitled".into(), |name| name.to_string_lossy());
+                let item = gio::MenuItem::new(Some(&label), None);
+                item.set_action_and_target_value(
+                    Some("win.open-recent-file"),
+                    Some(&path.as_os_str().as_bytes().to_variant()),
+                );
+                category_menu.append_item(&item);
+            }
+            game_menu.append_submenu(Some(category), &category_menu);
+        }
+        recent.append_submenu(Some(game), &game_menu);
+    }
+    if history.is_empty() {
+        recent.append(Some("No recent splits available"), Some("win.open-recent"));
+    }
+}
+
+fn fill_comparison_menu<'a>(comparisons: &gio::Menu, names: impl Iterator<Item = &'a str>) {
+    comparisons.remove_all();
+    for comparison in names {
+        let item = gio::MenuItem::new(Some(comparison), None);
+        item.set_action_and_target_value(Some("win.comparison"), Some(&comparison.to_variant()));
+        comparisons.append_item(&item);
+    }
 }
 
 pub(super) fn timer_resize_edge(

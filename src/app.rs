@@ -219,7 +219,7 @@ pub enum AppMsg {
 pub struct AppModel {
     pub timer: SharedTimer,
     pub layout: RefCell<LayoutData>,
-    pub config: RefCell<Config>,
+    pub config: Rc<RefCell<Config>>,
     pub image_cache: Rc<RefCell<ImageCache>>,
     pub hotkey_system: Option<HotkeySystem<SharedTimer>>,
     pub hotkey_availability: HotkeyAvailability,
@@ -328,6 +328,7 @@ impl SimpleComponent for AppModel {
         };
         platform.configure(&root, &config);
 
+        let config = Rc::new(RefCell::new(config));
         install_timer_interactions(&root, &picture, &timer, &config, platform, &sender);
         let closing_allowed = Rc::new(Cell::new(false));
         let close_guard = closing_allowed.clone();
@@ -348,7 +349,7 @@ impl SimpleComponent for AppModel {
                 layout_state: LayoutState::default(),
                 is_modified: false,
             }),
-            config: RefCell::new(config),
+            config,
             image_cache: Rc::new(RefCell::new(ImageCache::new())),
             hotkey_system,
             hotkey_availability,
@@ -395,6 +396,11 @@ impl SimpleComponent for AppModel {
                 self.render();
             }
             AppMsg::TimerCommand(command) => {
+                // Applying the splits editor replaces the run, which would
+                // discard anything the timer records meanwhile.
+                if self.open_editors.0.contains_key(&EditorKind::Run) {
+                    return;
+                }
                 if matches!(command, TimerCommand::Reset) {
                     self.request_reset(ResetAction::ResetOnly, &sender);
                     return;
@@ -467,14 +473,11 @@ impl SimpleComponent for AppModel {
             AppMsg::BeginIntent(intent) => self.pending_intent = intent,
             AppMsg::EditorFinished(kind) => {
                 self.open_editors.0.remove(&kind);
+                self.update_hotkey_activation();
                 if kind == EditorKind::Layout {
                     self.active_layout_editor = None;
                 } else if kind == EditorKind::Run {
                     self.active_run_editor = None;
-                } else if kind == EditorKind::Window {
-                    if let Some(system) = self.hotkey_system.as_mut() {
-                        let _ = system.activate();
-                    }
                 } else if kind == EditorKind::NotesViewer {
                     self.notes_viewer = None;
                 }
@@ -504,6 +507,8 @@ impl SimpleComponent for AppModel {
                 if result.is_ok() {
                     self.set_notes_actions_enabled(true);
                     sender.input(AppMsg::ContinuePendingAction);
+                } else {
+                    self.pending_action = None;
                 }
                 crate::config::or_show_error(result);
             }
@@ -517,10 +522,13 @@ impl SimpleComponent for AppModel {
                 if result.is_ok() {
                     self.layout.borrow_mut().is_modified = false;
                     sender.input(AppMsg::ContinuePendingAction);
+                } else {
+                    self.pending_action = None;
                 }
                 crate::config::or_show_error(result);
             }
             AppMsg::NewSplits => {
+                self.close_editor(EditorKind::Run);
                 self.close_notes_windows();
                 self.config
                     .borrow_mut()
@@ -544,6 +552,7 @@ impl SimpleComponent for AppModel {
                 let opened = result.is_ok();
                 crate::config::or_show_error(result);
                 if opened {
+                    self.close_editor(EditorKind::Run);
                     self.close_notes_windows();
                 }
                 self.set_notes_actions_enabled(self.config.borrow().splits_path().is_some());
@@ -577,16 +586,22 @@ impl SimpleComponent for AppModel {
                 }
                 crate::config::or_show_error(result);
             }
-            AppMsg::NewLayout => self.config.borrow_mut().new_layout(
-                Some(&mut self.timer.write().unwrap()),
-                &mut self.layout.borrow_mut(),
-            ),
+            AppMsg::NewLayout => {
+                self.close_editor(EditorKind::Layout);
+                self.config.borrow_mut().new_layout(
+                    Some(&mut self.timer.write().unwrap()),
+                    &mut self.layout.borrow_mut(),
+                );
+            }
             AppMsg::OpenLayout(path) => {
                 let result = self.config.borrow_mut().open_layout(
                     Some(&mut self.timer.write().unwrap()),
                     &mut self.layout.borrow_mut(),
                     &path,
                 );
+                if result.is_ok() {
+                    self.close_editor(EditorKind::Layout);
+                }
                 crate::config::or_show_error(result);
             }
             AppMsg::SaveLayout => {
@@ -728,6 +743,35 @@ impl AppModel {
         );
         if self.mouse_passthrough.replace(enabled) != enabled {
             self.platform.set_mouse_passthrough(&self.window, enabled);
+        }
+    }
+
+    /// Closes an editor without applying it, as its draft belongs to the
+    /// splits or layout that are being replaced.
+    fn close_editor(&mut self, kind: EditorKind) {
+        if let Some(window) = self.open_editors.0.remove(&kind) {
+            window.close();
+        }
+        match kind {
+            EditorKind::Run => self.active_run_editor = None,
+            EditorKind::Layout => self.active_layout_editor = None,
+            _ => {}
+        }
+        self.update_hotkey_activation();
+    }
+
+    /// Global hotkeys are off while hotkeys are being configured and while
+    /// the splits editor is open, as applying it would discard the attempt.
+    fn update_hotkey_activation(&mut self) {
+        let Some(system) = self.hotkey_system.as_mut() else {
+            return;
+        };
+        if self.open_editors.0.contains_key(&EditorKind::Window)
+            || self.open_editors.0.contains_key(&EditorKind::Run)
+        {
+            let _ = system.deactivate();
+        } else {
+            let _ = system.activate();
         }
     }
 
@@ -886,7 +930,9 @@ impl AppModel {
         }
     }
 
-    fn save_current_pending_document(&self, sender: &ComponentSender<Self>) {
+    /// Saves the document the pending action is waiting on. A failed save
+    /// cancels the action, so it doesn't go ahead with unsaved changes.
+    fn save_current_pending_document(&mut self, sender: &ComponentSender<Self>) {
         let Some(state) = self.pending_action.as_ref() else {
             return;
         };
@@ -897,10 +943,12 @@ impl AppModel {
                     .config
                     .borrow_mut()
                     .save_splits(&mut self.timer.write().unwrap());
-                crate::config::or_show_error(result);
-                if !self.timer.read().unwrap().run().has_been_modified() {
+                if result.is_ok() {
                     sender.input(AppMsg::ContinuePendingAction);
+                } else {
+                    self.pending_action = None;
                 }
+                crate::config::or_show_error(result);
             } else {
                 let sender = sender.clone();
                 choose_save_path(&self.window, "Save Splits", move |path| {
@@ -916,6 +964,8 @@ impl AppModel {
             if result.is_ok() {
                 self.layout.borrow_mut().is_modified = false;
                 sender.input(AppMsg::ContinuePendingAction);
+            } else {
+                self.pending_action = None;
             }
             crate::config::or_show_error(result);
         } else {
@@ -952,9 +1002,6 @@ impl AppModel {
             window.present();
             return;
         }
-        if let Some(system) = self.hotkey_system.as_mut() {
-            let _ = system.deactivate();
-        }
         let draft = Rc::new(RefCell::new(self.config.borrow().hotkeys()));
         let window = build_settings_editor(
             &self.window,
@@ -966,6 +1013,7 @@ impl AppModel {
         self.open_editors
             .0
             .insert(EditorKind::Window, window.clone());
+        self.update_hotkey_activation();
         window.present();
     }
 
@@ -1031,6 +1079,15 @@ them.\n\nDiagnostic: {error}\n\nSee the application log and your distribution's 
             window.present();
             return;
         }
+        if self.timer.read().unwrap().current_phase() != livesplit_core::TimerPhase::NotRunning {
+            let dialog = gtk::AlertDialog::builder()
+                .message("The timer is running")
+                .detail("Reset the timer before editing the splits.")
+                .modal(true)
+                .build();
+            dialog.show(Some(&self.window));
+            return;
+        }
         // The editor restores the auto splitter from its run when cancelled,
         // so the run needs to reflect the live settings.
         self.store_auto_splitter_settings();
@@ -1045,11 +1102,11 @@ them.\n\nDiagnostic: {error}\n\nSee the application log and your distribution's 
             sender,
             #[cfg(feature = "auto-splitting")]
             self.auto_splitter.clone(),
-            #[cfg(feature = "auto-splitting")]
             self.timer.clone(),
         );
         self.active_run_editor = Some(editor);
         self.open_editors.0.insert(EditorKind::Run, window.clone());
+        self.update_hotkey_activation();
         window.present();
     }
 
