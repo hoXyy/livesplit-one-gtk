@@ -1,113 +1,110 @@
 use super::*;
 
 #[cfg(feature = "auto-splitting")]
-fn auto_splitter_summary(association: Option<&AutoSplitterAssociation>) -> String {
-    match association {
-        Some(AutoSplitterAssociation::Local { path }) => format!("Local — {}", path.display()),
-        Some(AutoSplitterAssociation::Registry {
-            game, cached_path, ..
-        }) => format!("Registry — {game} ({})", cached_path.display()),
-        None => "No auto splitter associated".to_owned(),
+fn auto_splitter_summary(path: Option<&std::path::Path>) -> String {
+    match path {
+        Some(path) if crate::autosplitter_registry::is_managed(path) => {
+            format!("Registry — {}", path.display())
+        }
+        Some(path) => format!("Local — {}", path.display()),
+        None => "No auto splitter loaded".to_owned(),
     }
 }
 
 #[cfg(feature = "auto-splitting")]
 pub(super) fn build_run_auto_splitter_section(
     parent: &adw::ApplicationWindow,
-    game: &str,
-    pending: &Rc<RefCell<Option<AutoSplitterAssociation>>>,
+    editor: &Rc<RefCell<Option<livesplit_core::RunEditor>>>,
+    changed: &Rc<Cell<bool>>,
     runtime: &Rc<livesplit_core::auto_splitting::Runtime<SharedTimer>>,
     timer: &SharedTimer,
-    can_associate: bool,
 ) -> gtk::Widget {
+    let loaded_path = runtime.loaded_path();
     let row = adw::ActionRow::builder()
         .title("Auto Splitter")
-        .subtitle(auto_splitter_summary(pending.borrow().as_ref()))
+        .subtitle(auto_splitter_summary(loaded_path.as_deref()))
         .build();
     let settings = gtk::Button::with_label("Settings…");
-    settings.set_sensitive(pending.borrow().is_some());
+    settings.set_sensitive(loaded_path.is_some());
     let remove = gtk::Button::from_icon_name("edit-delete-symbolic");
     remove.set_tooltip_text(Some("Remove auto splitter"));
     let registry = gtk::Button::with_label("Find in Registry");
-    registry.set_sensitive(can_associate);
-    let registry_game = game.to_owned();
-    let registry_pending = pending.clone();
+    let registry_editor = editor.clone();
+    let registry_changed = changed.clone();
     let registry_runtime = runtime.clone();
     let registry_timer = timer.clone();
     let registry_row = row.clone();
     let registry_settings = settings.clone();
     registry.connect_clicked(move |button| {
-        if registry_game.trim().is_empty() {
+        // Read the game name on click, as it may have been edited since the
+        // dialog was opened.
+        let game = registry_editor
+            .borrow()
+            .as_ref()
+            .map(|editor| editor.run().game_name().trim().to_owned())
+            .unwrap_or_default();
+        if game.is_empty() {
             registry_row.set_subtitle("Enter a game name before searching the registry");
             return;
         }
         button.set_sensitive(false);
         registry_row.set_subtitle("Checking the LiveSplit auto splitter registry…");
-        let (result_sender, result_receiver) = std::sync::mpsc::channel();
-        let game = registry_game.clone();
-        std::thread::spawn(move || {
-            let result = crate::autosplitter_registry::load_cached_or_refresh()
-                .and_then(|entries| {
-                    crate::autosplitter_registry::matching(&entries, &game)
-                        .cloned()
-                        .ok_or_else(|| anyhow::anyhow!("No registry entry matches {game}"))
-                })
-                .and_then(|entry| {
-                    if !entry.installable {
-                        anyhow::bail!("The matching entry is {}", entry.compatibility.label());
-                    }
-                    let download = crate::autosplitter_registry::download_to_temporary(&entry)?;
-                    Ok((entry, download))
-                })
-                .map_err(|error| error.to_string());
-            let _ = result_sender.send(result);
-        });
-        let pending = registry_pending.clone();
+        let download = relm4::spawn(crate::autosplitter_registry::download_for_game(game));
+        let changed = registry_changed.clone();
         let runtime = registry_runtime.clone();
         let timer = registry_timer.clone();
         let status = registry_row.clone();
         let button = button.clone();
         let settings = registry_settings.clone();
-        glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
-            let Ok(result) = result_receiver.try_recv() else {
-                return glib::ControlFlow::Continue;
+        glib::spawn_future_local(async move {
+            let result = match download.await {
+                Ok(result) => result,
+                Err(error) => Err(anyhow::anyhow!("Registry lookup failed: {error}")),
             };
             button.set_sensitive(true);
-            match result {
-                Ok((entry, (temporary, destination, url))) => {
-                    if timer.read().unwrap().current_phase()
-                        != livesplit_core::TimerPhase::NotRunning
-                    {
-                        let _ = std::fs::remove_file(temporary);
-                        status.set_subtitle("Reset the timer before changing the auto splitter");
-                    } else if let Err(error) = runtime.load(temporary.clone(), timer.clone()) {
-                        let _ = std::fs::remove_file(temporary);
-                        status.set_subtitle(&format!("Auto splitter failed to load: {error}"));
-                    } else if let Err(error) = std::fs::rename(&temporary, &destination) {
-                        let _ = runtime.unload();
-                        status.set_subtitle(&format!("Could not install auto splitter: {error}"));
-                    } else {
-                        let association = AutoSplitterAssociation::Registry {
-                            game: entry.game,
-                            last_url: url,
-                            cached_path: destination,
-                        };
-                        status.set_subtitle(&auto_splitter_summary(Some(&association)));
-                        *pending.borrow_mut() = Some(association);
-                        settings.set_sensitive(true);
-                    }
+            let (temporary, destination) = match result {
+                Ok(paths) => paths,
+                Err(error) => {
+                    status.set_subtitle(&format!("{error:#}"));
+                    return;
                 }
-                Err(error) => status.set_subtitle(&error),
+            };
+            if timer.read().unwrap().current_phase() != livesplit_core::TimerPhase::NotRunning {
+                let _ = std::fs::remove_file(temporary);
+                status.set_subtitle("Reset the timer before changing the auto splitter");
+                return;
             }
-            glib::ControlFlow::Break
+            changed.set(true);
+            if let Err(error) = runtime.load_from_path(timer.clone(), temporary.clone()) {
+                let _ = std::fs::remove_file(temporary);
+                status.set_subtitle(&format!("Auto splitter failed to load: {error}"));
+                settings.set_sensitive(false);
+                return;
+            }
+            // Load once more from the installed location, so that's the path
+            // stored in the splits file rather than the temporary download.
+            let installed = std::fs::rename(&temporary, &destination)
+                .map_err(anyhow::Error::from)
+                .and_then(|()| Ok(runtime.load_from_path(timer.clone(), destination.clone())?));
+            match installed {
+                Ok(()) => {
+                    status.set_subtitle(&auto_splitter_summary(Some(&destination)));
+                    settings.set_sensitive(true);
+                }
+                Err(error) => {
+                    let _ = std::fs::remove_file(temporary);
+                    let _ = runtime.unload();
+                    status.set_subtitle(&format!("Could not install auto splitter: {error}"));
+                    settings.set_sensitive(false);
+                }
+            }
         });
     });
     row.add_suffix(&registry);
 
     let local = gtk::Button::with_label("Select Local…");
-    local.set_sensitive(can_associate);
     let local_parent = parent.clone();
-    let local_pending = pending.clone();
+    let local_changed = changed.clone();
     let local_runtime = runtime.clone();
     let local_timer = timer.clone();
     let local_row = row.clone();
@@ -122,7 +119,7 @@ pub(super) fn build_run_auto_splitter_section(
             .title("Select Local WASM Auto Splitter")
             .filters(&filters)
             .build();
-        let pending = local_pending.clone();
+        let changed = local_changed.clone();
         let runtime = local_runtime.clone();
         let timer = local_timer.clone();
         let status = local_row.clone();
@@ -135,15 +132,15 @@ pub(super) fn build_run_auto_splitter_section(
                 status.set_subtitle("Reset the timer before changing the auto splitter");
                 return;
             }
-            match runtime.load(path.clone(), timer.clone()) {
+            changed.set(true);
+            match runtime.load_from_path(timer.clone(), path.clone()) {
                 Ok(()) => {
-                    let association = AutoSplitterAssociation::Local { path };
-                    status.set_subtitle(&auto_splitter_summary(Some(&association)));
-                    *pending.borrow_mut() = Some(association);
+                    status.set_subtitle(&auto_splitter_summary(Some(&path)));
                     settings.set_sensitive(true);
                 }
                 Err(error) => {
                     status.set_subtitle(&format!("Auto splitter failed to load: {error}"));
+                    settings.set_sensitive(false);
                 }
             }
         });
@@ -151,33 +148,32 @@ pub(super) fn build_run_auto_splitter_section(
     row.add_suffix(&local);
 
     let settings_parent = parent.clone();
+    let settings_changed = changed.clone();
     let settings_runtime = runtime.clone();
     settings.connect_clicked(move |_| {
-        open_auto_splitter_settings(&settings_parent, &settings_runtime);
+        open_auto_splitter_settings(&settings_parent, &settings_changed, &settings_runtime);
     });
     row.add_suffix(&settings);
-    let remove_pending = pending.clone();
+    let remove_changed = changed.clone();
     let remove_runtime = runtime.clone();
     let remove_row = row.clone();
     let remove_settings = settings.clone();
     remove.connect_clicked(move |_| match remove_runtime.unload() {
         Ok(()) => {
-            *remove_pending.borrow_mut() = None;
+            remove_changed.set(true);
             remove_row.set_subtitle(&auto_splitter_summary(None));
             remove_settings.set_sensitive(false);
         }
         Err(error) => remove_row.set_subtitle(&format!("Could not unload: {error}")),
     });
     row.add_suffix(&remove);
-    if !can_associate {
-        row.set_subtitle("Save the splits before associating an auto splitter");
-    }
     row.upcast()
 }
 
 #[cfg(feature = "auto-splitting")]
 fn open_auto_splitter_settings(
     parent: &adw::ApplicationWindow,
+    changed: &Rc<Cell<bool>>,
     runtime: &Rc<livesplit_core::auto_splitting::Runtime<SharedTimer>>,
 ) {
     use livesplit_core::auto_splitting::settings::{Value, WidgetKind};
@@ -208,6 +204,7 @@ fn open_auto_splitter_settings(
         loading.add_suffix(&spinner);
         group.add(&loading);
         let attempts = Rc::new(Cell::new(0_u8));
+        let retry_changed = changed.clone();
         let retry_runtime = runtime.clone();
         let retry_parent = parent.clone();
         let retry_window = window.clone();
@@ -217,7 +214,7 @@ fn open_auto_splitter_settings(
                 .is_some_and(|widgets| !widgets.is_empty())
             {
                 retry_window.close();
-                open_auto_splitter_settings(&retry_parent, &retry_runtime);
+                open_auto_splitter_settings(&retry_parent, &retry_changed, &retry_runtime);
                 return glib::ControlFlow::Break;
             }
             let next = attempts.get() + 1;
@@ -256,10 +253,12 @@ fn open_auto_splitter_settings(
                     .build();
                 row.set_tooltip_text(widget.tooltip.as_deref());
                 let key = widget.key.clone();
+                let changed = changed.clone();
                 let runtime = runtime.clone();
                 row.connect_active_notify(move |row| {
                     let mut map = runtime.settings_map().unwrap_or_default();
                     map.insert(key.clone(), Value::Bool(row.is_active()));
+                    changed.set(true);
                     runtime.set_settings_map(map);
                 });
                 group.add(&row);
@@ -290,6 +289,7 @@ fn open_auto_splitter_settings(
                 row.set_tooltip_text(widget.tooltip.as_deref());
                 let key = widget.key.clone();
                 let options = options.clone();
+                let changed = changed.clone();
                 let runtime = runtime.clone();
                 row.connect_selected_notify(move |row| {
                     let Some(option) = options.get(row.selected() as usize) else {
@@ -297,6 +297,7 @@ fn open_auto_splitter_settings(
                     };
                     let mut map = runtime.settings_map().unwrap_or_default();
                     map.insert(key.clone(), Value::String(option.key.clone()));
+                    changed.set(true);
                     runtime.set_settings_map(map);
                 });
                 group.add(&row);
@@ -314,6 +315,7 @@ fn open_auto_splitter_settings(
                 let choose = gtk::Button::with_label("Choose…");
                 let key = widget.key.clone();
                 let runtime = runtime.clone();
+                let changed = changed.clone();
                 let parent = window.clone();
                 let status = row.clone();
                 let filters = filters.clone();
@@ -345,6 +347,7 @@ fn open_auto_splitter_settings(
                         dialog.set_filters(Some(&gtk_filters));
                     }
                     let key = key.clone();
+                    let changed = changed.clone();
                     let runtime = runtime.clone();
                     let status = status.clone();
                     dialog.open(Some(&parent), gio::Cancellable::NONE, move |result| {
@@ -358,11 +361,33 @@ fn open_auto_splitter_settings(
                         };
                         let mut map = runtime.settings_map().unwrap_or_default();
                         map.insert(key.clone(), Value::String(path_value.into()));
+                        changed.set(true);
                         runtime.set_settings_map(map);
                         status.set_subtitle(&path.to_string_lossy());
                     });
                 });
                 row.add_suffix(&choose);
+                group.add(&row);
+            }
+            WidgetKind::TextInput { default_value } => {
+                let value = settings_map
+                    .get(widget.key.as_ref())
+                    .and_then(Value::as_string)
+                    .unwrap_or(default_value);
+                let row = adw::EntryRow::builder()
+                    .title(widget.description.as_ref())
+                    .text(value.as_ref())
+                    .build();
+                row.set_tooltip_text(widget.tooltip.as_deref());
+                let key = widget.key.clone();
+                let changed = changed.clone();
+                let runtime = runtime.clone();
+                row.connect_changed(move |row| {
+                    let mut map = runtime.settings_map().unwrap_or_default();
+                    map.insert(key.clone(), Value::String(row.text().as_str().into()));
+                    runtime.set_settings_map(map);
+                    changed.set(true);
+                });
                 group.add(&row);
             }
         }

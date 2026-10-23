@@ -614,6 +614,26 @@ pub fn build_setting_row(field: &Field, changed: SettingChanged) -> adw::Prefere
                 },
             )
         }
+        Value::IconDisplayMode(value) => {
+            use livesplit_core::component::detailed_timer::IconDisplayMode::*;
+            enum_row(
+                field,
+                &["Hidden", "Both Rows", "First Row"],
+                match value {
+                    Hidden => 0,
+                    BothRows => 1,
+                    FirstRow => 2,
+                },
+                changed,
+                |index| {
+                    Value::IconDisplayMode(match index {
+                        1 => BothRows,
+                        2 => FirstRow,
+                        _ => Hidden,
+                    })
+                },
+            )
+        }
         Value::Hotkey(value) => {
             let row = adw::ActionRow::builder()
                 .title(field.text.as_ref())

@@ -31,7 +31,7 @@ anyhow = "1.0.104"
 fontdb = "0.16.2"
 clap = { version = "4.6.6", features = ["derive"] }
 ureq = "2.12.1"
-roxmltree = "0.20.0"
+reqwest = { version = "0.13", default-features = false, optional = true }
 pulldown-cmark = { version = "0.13.4", default-features = false }
 nix = { version = "0.31.3", features = ["user"] }
 
@@ -40,7 +40,7 @@ glib-build-tools = "0.22"
 
 [features]
 default = ["auto-splitting"]
-auto-splitting = ["livesplit-core/auto-splitting"]
+auto-splitting = ["livesplit-core/auto-splitting", "livesplit-core/networking", "dep:reqwest"]
 
 [profile.max-opt]
 inherits = "release"
