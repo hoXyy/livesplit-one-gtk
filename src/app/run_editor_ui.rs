@@ -144,12 +144,10 @@ pub(super) fn build_run_editor(
     parent: &gtk::ApplicationWindow,
     editor: Rc<RefCell<Option<livesplit_core::RunEditor>>>,
     sender: &ComponentSender<AppModel>,
-    #[cfg(feature = "auto-splitting")] original_auto_splitter: Option<AutoSplitterAssociation>,
     #[cfg(feature = "auto-splitting")] auto_splitter: Rc<
         livesplit_core::auto_splitting::Runtime<SharedTimer>,
     >,
     #[cfg(feature = "auto-splitting")] timer: SharedTimer,
-    #[cfg(feature = "auto-splitting")] can_associate_auto_splitter: bool,
 ) -> adw::ApplicationWindow {
     let window = adw::ApplicationWindow::builder()
         .title("Edit Splits")
@@ -172,9 +170,7 @@ pub(super) fn build_run_editor(
         .build();
     let splits_page = gtk::Box::new(gtk::Orientation::Vertical, 12);
     #[cfg(feature = "auto-splitting")]
-    let pending_auto_splitter = Rc::new(RefCell::new(original_auto_splitter.clone()));
-    #[cfg(feature = "auto-splitting")]
-    let original_auto_splitter_settings = auto_splitter.settings_map().unwrap_or_default();
+    let auto_splitter_changed = Rc::new(Cell::new(false));
     #[cfg(feature = "auto-splitting")]
     let auto_splitter_applied = Rc::new(Cell::new(false));
 
@@ -636,11 +632,10 @@ pub(super) fn build_run_editor(
     #[cfg(feature = "auto-splitting")]
     splits_page.append(&build_run_auto_splitter_section(
         &window,
-        &state.game,
-        &pending_auto_splitter,
+        &editor,
+        &auto_splitter_changed,
         &auto_splitter,
         &timer,
-        can_associate_auto_splitter,
     ));
 
     let segment_header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -901,6 +896,10 @@ pub(super) fn build_run_editor(
     let apply_sender = sender.clone();
     #[cfg(feature = "auto-splitting")]
     let applied_on_apply = auto_splitter_applied.clone();
+    #[cfg(feature = "auto-splitting")]
+    let changed_on_apply = auto_splitter_changed.clone();
+    #[cfg(feature = "auto-splitting")]
+    let apply_runtime = auto_splitter.clone();
     apply.connect_clicked(move |_| {
         if let Some(run) = apply_editor
             .borrow_mut()
@@ -912,9 +911,11 @@ pub(super) fn build_run_editor(
         #[cfg(feature = "auto-splitting")]
         {
             applied_on_apply.set(true);
-            apply_sender.input(AppMsg::ApplyAutoSplitterAssociation(
-                pending_auto_splitter.borrow().clone(),
-            ));
+            // Applying the run replaces its stored auto splitter with the one
+            // from when the editor opened, so store the current one again.
+            if changed_on_apply.get() || apply_runtime.loaded_path().is_some() {
+                apply_sender.input(AppMsg::StoreAutoSplitterSettings);
+            }
         }
         apply_window.close();
     });
@@ -925,15 +926,11 @@ pub(super) fn build_run_editor(
     let restore_timer = timer.clone();
     window.connect_close_request(move |_| {
         #[cfg(feature = "auto-splitting")]
-        if !auto_splitter_applied.get() {
-            let _ = restore_runtime.unload();
-            if let Some(association) = &original_auto_splitter {
-                if restore_runtime
-                    .load(association.path().into(), restore_timer.clone())
-                    .is_ok()
-                {
-                    restore_runtime.set_settings_map(original_auto_splitter_settings.clone());
-                }
+        if !auto_splitter_applied.get() && auto_splitter_changed.get() {
+            // The timer's run still stores the auto splitter from when the
+            // editor opened.
+            if let Err(error) = restore_runtime.load(restore_timer.clone()) {
+                log::error!("Auto Splitter failed to load: {error}");
             }
         }
         close_sender.input(AppMsg::EditorFinished(EditorKind::Run));

@@ -40,6 +40,10 @@ pub struct Config {
     window: Window,
     #[serde(default)]
     hotkeys: HotkeyConfig,
+    /// Auto splitter passed on the command line. It replaces the one stored
+    /// in the splits file that is loaded on startup.
+    #[serde(skip)]
+    cli_auto_splitter: Option<PathBuf>,
 }
 
 #[derive(Default, Deserialize, Serialize)]
@@ -100,13 +104,16 @@ struct General {
     /// Legacy global auto-splitter path. Migrated on load.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     auto_splitter: Option<PathBuf>,
-    #[serde(default)]
-    auto_splitters: BTreeMap<PathBuf, AutoSplitterAssociation>,
+    /// Legacy per-splits auto splitters. Auto splitters are stored in the
+    /// splits file now, so these only migrate splits that predate that. An
+    /// entry is dropped once its splits file stores an auto splitter itself.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    auto_splitters: BTreeMap<PathBuf, LegacyAutoSplitterAssociation>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
-pub enum AutoSplitterAssociation {
+enum LegacyAutoSplitterAssociation {
     Local {
         path: PathBuf,
     },
@@ -117,8 +124,8 @@ pub enum AutoSplitterAssociation {
     },
 }
 
-impl AutoSplitterAssociation {
-    pub fn path(&self) -> &Path {
+impl LegacyAutoSplitterAssociation {
+    fn path(&self) -> &Path {
         match self {
             Self::Local { path } => path,
             Self::Registry { cached_path, .. } => cached_path,
@@ -171,7 +178,8 @@ impl Config {
         let mut cfg = Self::parse().unwrap_or_default();
         cfg.load_splits_path(cli.splits);
         cfg.load_layout_path(cli.layout);
-        cfg.migrate_and_load_autosplitter(cli.autosplitter);
+        cfg.migrate_legacy_autosplitter();
+        cfg.cli_auto_splitter = cli.autosplitter;
         cfg.save_config();
         cfg
     }
@@ -206,12 +214,13 @@ impl Config {
         self.general.layout = Some(layout_file);
     }
 
-    fn migrate_and_load_autosplitter(&mut self, autosplitter_file: Option<PathBuf>) {
-        let path = autosplitter_file.or_else(|| self.general.auto_splitter.take());
+    fn migrate_legacy_autosplitter(&mut self) {
+        let path = self.general.auto_splitter.take();
         if let (Some(splits), Some(path)) = (self.splits.current.clone(), path) {
             self.general
                 .auto_splitters
-                .insert(splits, AutoSplitterAssociation::Local { path });
+                .entry(splits)
+                .or_insert(LegacyAutoSplitterAssociation::Local { path });
         }
     }
 
@@ -360,10 +369,6 @@ impl Config {
         timer.set_run(default_run()).map_err(drop).unwrap();
         self.splits.can_save = false;
         self.splits.current = None;
-        #[cfg(feature = "auto-splitting")]
-        {
-            // The runtime is unloaded by the caller, which owns it.
-        }
         self.save_config();
     }
 
@@ -401,7 +406,7 @@ impl Config {
         }
 
         #[cfg(feature = "auto-splitting")]
-        self.load_associated_auto_splitter(auto_splitter, shared_timer.clone())?;
+        self.load_auto_splitter(auto_splitter, shared_timer)?;
 
         Ok(())
     }
@@ -414,16 +419,8 @@ impl Config {
         self.splits.current.as_deref()
     }
 
-    pub fn save_splits(
-        &mut self,
-        timer: &mut Timer,
-        #[cfg(feature = "auto-splitting")] runtime: &livesplit_core::auto_splitting::Runtime<
-            SharedTimer,
-        >,
-    ) -> Result<()> {
+    pub fn save_splits(&mut self, timer: &mut Timer) -> Result<()> {
         if let Some(path) = &self.splits.current {
-            #[cfg(feature = "auto-splitting")]
-            timer.run_auto_splitter_settings_map_store(runtime.settings_map().unwrap_or_default());
             let mut buf = String::new();
             save_timer(timer, &mut buf).context("Failed saving the splits.")?;
             fs::write(path, &buf).context("Failed writing the file.")?;
@@ -437,34 +434,17 @@ impl Config {
         Ok(())
     }
 
-    pub fn save_splits_as(
-        &mut self,
-        timer: &mut Timer,
-        #[cfg(feature = "auto-splitting")] runtime: &livesplit_core::auto_splitting::Runtime<
-            SharedTimer,
-        >,
-        path: PathBuf,
-    ) -> Result<()> {
-        #[cfg(feature = "auto-splitting")]
-        timer.run_auto_splitter_settings_map_store(runtime.settings_map().unwrap_or_default());
+    pub fn save_splits_as(&mut self, timer: &mut Timer, path: PathBuf) -> Result<()> {
         let mut buf = String::new();
         save_timer(timer, &mut buf).context("Failed saving the splits.")?;
         fs::write(&path, &buf).context("Failed writing the file.")?;
         timer.mark_as_unmodified();
 
-        let old_path = self.splits.current.clone();
         if !self.splits.can_save {
             self.splits.remove_from_history();
         }
         self.splits.can_save = true;
-        self.splits.current = Some(path.clone());
-        if let Some(association) = old_path
-            .as_ref()
-            .and_then(|old| self.general.auto_splitters.get(old))
-            .cloned()
-        {
-            self.general.auto_splitters.insert(path, association);
-        }
+        self.splits.current = Some(path);
         self.splits.add_to_history(timer.run());
 
         self.save_config();
@@ -549,28 +529,6 @@ impl Config {
         self.general.layout.is_some() && self.general.can_save_layout
     }
 
-    pub fn auto_splitter_association(&self) -> Option<&AutoSplitterAssociation> {
-        self.splits
-            .current
-            .as_ref()
-            .and_then(|path| self.general.auto_splitters.get(path))
-    }
-
-    pub fn set_auto_splitter_association(&mut self, association: Option<AutoSplitterAssociation>) {
-        let Some(path) = self.splits.current.clone() else {
-            return;
-        };
-        match association {
-            Some(association) => {
-                self.general.auto_splitters.insert(path, association);
-            }
-            None => {
-                self.general.auto_splitters.remove(&path);
-            }
-        }
-        self.save_config();
-    }
-
     pub fn set_comparison(&mut self, comparison: String) {
         self.general.comparison = Some(comparison);
         self.save_config();
@@ -623,29 +581,52 @@ impl Config {
         Some((self.window.x?, self.window.y?))
     }
 
+    /// Returns the auto splitter to load instead of the one stored in the run,
+    /// if any. Drops the legacy association of splits that store their own.
     #[cfg(feature = "auto-splitting")]
-    pub fn maybe_load_auto_splitter(
-        &self,
-        runtime: &livesplit_core::auto_splitting::Runtime<SharedTimer>,
-        timer: SharedTimer,
-    ) {
-        if let Some(auto_splitter) = self.auto_splitter_association() {
-            if let Err(e) = runtime.load(auto_splitter.path().into(), timer) {
-                // TODO: Error chain
-                log::error!("Auto Splitter failed to load: {}", e);
-            }
+    fn auto_splitter_override(&mut self, run: &Run) -> Option<PathBuf> {
+        if let Some(path) = self.cli_auto_splitter.take() {
+            return Some(path);
         }
+        let splits = self.splits.current.as_ref()?;
+        let stores_own = run
+            .stored_auto_splitter_settings()
+            .is_ok_and(|stored| stored.script_path().is_some_and(|path| !path.is_empty()));
+        if stores_own {
+            self.general.auto_splitters.remove(splits);
+            return None;
+        }
+        Some(self.general.auto_splitters.get(splits)?.path().to_owned())
     }
 
+    /// Loads the auto splitter for the timer's run. An auto splitter passed on
+    /// the command line takes precedence over the one stored in the splits
+    /// file. Splits that don't store one yet fall back to their legacy
+    /// association from the config, which is then written into the run, so the
+    /// next save migrates it into the splits file.
     #[cfg(feature = "auto-splitting")]
-    fn load_associated_auto_splitter(
-        &self,
+    pub fn load_auto_splitter(
+        &mut self,
         runtime: &livesplit_core::auto_splitting::Runtime<SharedTimer>,
-        timer: SharedTimer,
+        timer: &SharedTimer,
     ) -> Result<()> {
-        runtime.unload()?;
-        if let Some(association) = self.auto_splitter_association() {
-            runtime.load(association.path().into(), timer)?;
+        let legacy_count = self.general.auto_splitters.len();
+        let override_path = self.auto_splitter_override(timer.read().unwrap().run());
+        if self.general.auto_splitters.len() != legacy_count {
+            self.save_config();
+        }
+        match override_path {
+            Some(path) => {
+                runtime
+                    .load_from_path(timer.clone(), path)
+                    .context("Auto Splitter failed to load.")?;
+                runtime.store_settings();
+            }
+            None => {
+                runtime
+                    .load(timer.clone())
+                    .context("Auto Splitter failed to load.")?;
+            }
         }
         Ok(())
     }
@@ -669,7 +650,170 @@ pub fn or_show_error(result: Result<()>) {
 
 #[cfg(test)]
 mod tests {
-    use super::Config;
+    use super::{Config, LegacyAutoSplitterAssociation};
+    #[cfg(feature = "auto-splitting")]
+    use livesplit_core::{run::parser::composite, Run, StoredAutoSplitterSettings};
+    use std::path::{Path, PathBuf};
+
+    const LEGACY_CONFIG: &str = r#"
+splits:
+  current: /splits/game.lss
+general:
+  auto-splitters:
+    /splits/game.lss:
+      kind: local
+      path: /splitters/local.wasm
+    /splits/other.lss:
+      kind: registry
+      game: Other Game
+      last_url: https://example.com/other.wasm
+      cached_path: /cache/Other_Game/other.wasm
+"#;
+
+    #[test]
+    fn legacy_associations_deserialize() {
+        let config: Config = serde_yaml::from_str(LEGACY_CONFIG).unwrap();
+        let associations = &config.general.auto_splitters;
+        assert_eq!(
+            associations[Path::new("/splits/game.lss")].path(),
+            Path::new("/splitters/local.wasm")
+        );
+        assert!(matches!(
+            &associations[Path::new("/splits/other.lss")],
+            LegacyAutoSplitterAssociation::Registry { cached_path, .. }
+                if cached_path == Path::new("/cache/Other_Game/other.wasm")
+        ));
+    }
+
+    #[test]
+    fn legacy_global_auto_splitter_migrates_to_current_splits() {
+        let mut config: Config = serde_yaml::from_str(
+            "splits:\n  current: /splits/new.lss\ngeneral:\n  auto-splitter: /splitters/global.wasm\n",
+        )
+        .unwrap();
+        config.migrate_legacy_autosplitter();
+        assert_eq!(config.general.auto_splitter, None);
+        assert_eq!(
+            config.general.auto_splitters[Path::new("/splits/new.lss")].path(),
+            Path::new("/splitters/global.wasm")
+        );
+    }
+
+    #[test]
+    fn legacy_global_auto_splitter_keeps_existing_association() {
+        let mut config: Config = serde_yaml::from_str(LEGACY_CONFIG).unwrap();
+        config.general.auto_splitter = Some("/splitters/global.wasm".into());
+        config.migrate_legacy_autosplitter();
+        assert_eq!(
+            config.general.auto_splitters[Path::new("/splits/game.lss")].path(),
+            Path::new("/splitters/local.wasm")
+        );
+    }
+
+    #[test]
+    fn empty_legacy_associations_are_not_serialized() {
+        let encoded = serde_yaml::to_string(&Config::default()).unwrap();
+        assert!(!encoded.contains("auto-splitter"), "{encoded}");
+    }
+
+    #[cfg(feature = "auto-splitting")]
+    fn run_with_script_path(path: Option<&str>) -> Run {
+        let mut run = Run::new();
+        let mut stored = StoredAutoSplitterSettings::new();
+        stored.set_script_path(path);
+        run.set_stored_auto_splitter_settings(&stored);
+        run
+    }
+
+    #[cfg(feature = "auto-splitting")]
+    #[test]
+    fn splits_without_a_stored_auto_splitter_use_the_legacy_association() {
+        let mut config: Config = serde_yaml::from_str(LEGACY_CONFIG).unwrap();
+        assert_eq!(
+            config.auto_splitter_override(&run_with_script_path(None)),
+            Some(PathBuf::from("/splitters/local.wasm"))
+        );
+        // Kept until the splits file has been saved with its auto splitter.
+        assert!(config
+            .general
+            .auto_splitters
+            .contains_key(Path::new("/splits/game.lss")));
+    }
+
+    #[cfg(feature = "auto-splitting")]
+    #[test]
+    fn splits_storing_an_auto_splitter_drop_the_legacy_association() {
+        let mut config: Config = serde_yaml::from_str(LEGACY_CONFIG).unwrap();
+        let run = run_with_script_path(Some("/splitters/stored.wasm"));
+        assert_eq!(config.auto_splitter_override(&run), None);
+        assert!(!config
+            .general
+            .auto_splitters
+            .contains_key(Path::new("/splits/game.lss")));
+        // Other splits files keep theirs.
+        assert!(config
+            .general
+            .auto_splitters
+            .contains_key(Path::new("/splits/other.lss")));
+    }
+
+    #[cfg(feature = "auto-splitting")]
+    #[test]
+    fn command_line_auto_splitter_takes_precedence() {
+        let mut config: Config = serde_yaml::from_str(LEGACY_CONFIG).unwrap();
+        config.cli_auto_splitter = Some("/splitters/cli.wasm".into());
+        let run = run_with_script_path(Some("/splitters/stored.wasm"));
+        assert_eq!(
+            config.auto_splitter_override(&run),
+            Some(PathBuf::from("/splitters/cli.wasm"))
+        );
+        // It only applies to the splits loaded on startup.
+        assert_eq!(config.auto_splitter_override(&run), None);
+    }
+
+    #[cfg(feature = "auto-splitting")]
+    #[test]
+    fn splits_without_a_legacy_association_have_no_override() {
+        let mut config = Config::default();
+        assert_eq!(
+            config.auto_splitter_override(&run_with_script_path(None)),
+            None
+        );
+    }
+
+    /// Splits saved by earlier versions store the settings without a script
+    /// path. They need to keep parsing, so migrating the legacy association
+    /// keeps its settings.
+    #[cfg(feature = "auto-splitting")]
+    #[test]
+    fn settings_from_earlier_versions_parse_without_a_script_path() {
+        let lss = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Run version="1.8.0">
+  <GameIcon />
+  <GameName>Game</GameName>
+  <CategoryName>Any%</CategoryName>
+  <Metadata><Run id="" /><Platform usesEmulator="False"></Platform><Region></Region><Variables /></Metadata>
+  <Offset>00:00:00</Offset>
+  <AttemptCount>0</AttemptCount>
+  <AttemptHistory />
+  <Segments>
+    <Segment><Name>Time</Name><Icon /><SplitTimes><SplitTime name="Personal Best" /></SplitTimes><BestSegmentTime /><SegmentHistory /></Segment>
+  </Segments>
+  <AutoSplitterSettings>
+    <Version>1.0</Version>
+    <CustomSettings>
+      <Setting id="start" type="bool">True</Setting>
+      <Setting id="mode" type="string" value="fast" />
+    </CustomSettings>
+  </AutoSplitterSettings>
+</Run>"#;
+        let run = composite::parse(lss.as_bytes(), None).unwrap().run;
+        let stored = run.stored_auto_splitter_settings().unwrap();
+        assert_eq!(stored.script_path(), None);
+        let settings = stored.into_settings_map();
+        assert!(settings.get("start").is_some());
+        assert!(settings.get("mode").is_some());
+    }
 
     #[test]
     fn legacy_window_fields_round_trip() {

@@ -19,8 +19,6 @@ use livesplit_core::{
 };
 use relm4::{ComponentParts, ComponentSender, SimpleComponent};
 
-#[cfg(feature = "auto-splitting")]
-use crate::config::AutoSplitterAssociation;
 use crate::{
     config::Config,
     platform::{DisplayBackend, Platform, TimerWindowPlatform},
@@ -215,7 +213,7 @@ pub enum AppMsg {
     ApplyRun(RunDraft),
     ApplyHotkeys(livesplit_core::HotkeyConfig),
     #[cfg(feature = "auto-splitting")]
-    ApplyAutoSplitterAssociation(Option<AutoSplitterAssociation>),
+    StoreAutoSplitterSettings,
 }
 
 pub struct AppModel {
@@ -307,7 +305,7 @@ impl SimpleComponent for AppModel {
         #[cfg(feature = "auto-splitting")]
         let auto_splitter = Rc::new(livesplit_core::auto_splitting::Runtime::new());
         #[cfg(feature = "auto-splitting")]
-        config.maybe_load_auto_splitter(&auto_splitter, timer.clone());
+        crate::config::or_show_error(config.load_auto_splitter(&auto_splitter, &timer));
         let (window_width, window_height) = config.window_size();
         let width = window_width.round() as i32;
         let height = window_height.round() as i32;
@@ -498,12 +496,11 @@ impl SimpleComponent for AppModel {
                 self.resolve_pending_change(decision, &sender);
             }
             AppMsg::SavePendingSplitsAs(path) => {
-                let result = self.config.borrow_mut().save_splits_as(
-                    &mut self.timer.write().unwrap(),
-                    #[cfg(feature = "auto-splitting")]
-                    &self.auto_splitter,
-                    path,
-                );
+                self.store_auto_splitter_settings();
+                let result = self
+                    .config
+                    .borrow_mut()
+                    .save_splits_as(&mut self.timer.write().unwrap(), path);
                 if result.is_ok() {
                     self.set_notes_actions_enabled(true);
                     sender.input(AppMsg::ContinuePendingAction);
@@ -528,6 +525,12 @@ impl SimpleComponent for AppModel {
                 self.config
                     .borrow_mut()
                     .new_splits(&mut self.timer.write().unwrap());
+                #[cfg(feature = "auto-splitting")]
+                crate::config::or_show_error(
+                    self.config
+                        .borrow_mut()
+                        .load_auto_splitter(&self.auto_splitter, &self.timer),
+                );
                 self.set_notes_actions_enabled(false);
             }
             AppMsg::OpenSplits(path) => {
@@ -550,11 +553,11 @@ impl SimpleComponent for AppModel {
             }
             AppMsg::SaveSplitsConfirmed => {
                 if self.config.borrow().can_directly_save_splits() {
-                    let result = self.config.borrow_mut().save_splits(
-                        &mut self.timer.write().unwrap(),
-                        #[cfg(feature = "auto-splitting")]
-                        &self.auto_splitter,
-                    );
+                    self.store_auto_splitter_settings();
+                    let result = self
+                        .config
+                        .borrow_mut()
+                        .save_splits(&mut self.timer.write().unwrap());
                     crate::config::or_show_error(result);
                 } else {
                     select_file(&self.window, true, FileChoice::SaveSplits, &sender);
@@ -564,12 +567,11 @@ impl SimpleComponent for AppModel {
                 self.request_reset(ResetAction::SaveSplitsAs(path), &sender);
             }
             AppMsg::SaveSplitsAsConfirmed(path) => {
-                let result = self.config.borrow_mut().save_splits_as(
-                    &mut self.timer.write().unwrap(),
-                    #[cfg(feature = "auto-splitting")]
-                    &self.auto_splitter,
-                    path,
-                );
+                self.store_auto_splitter_settings();
+                let result = self
+                    .config
+                    .borrow_mut()
+                    .save_splits_as(&mut self.timer.write().unwrap(), path);
                 if result.is_ok() {
                     self.set_notes_actions_enabled(true);
                 }
@@ -635,11 +637,7 @@ impl SimpleComponent for AppModel {
                 self.config.borrow_mut().set_hotkeys(config);
             }
             #[cfg(feature = "auto-splitting")]
-            AppMsg::ApplyAutoSplitterAssociation(association) => {
-                self.config
-                    .borrow_mut()
-                    .set_auto_splitter_association(association);
-            }
+            AppMsg::StoreAutoSplitterSettings => self.auto_splitter.store_settings(),
         }
     }
 }
@@ -894,11 +892,11 @@ impl AppModel {
         };
         if state.current_document == Some(PendingDocument::Splits) {
             if self.config.borrow().can_directly_save_splits() {
-                let result = self.config.borrow_mut().save_splits(
-                    &mut self.timer.write().unwrap(),
-                    #[cfg(feature = "auto-splitting")]
-                    &self.auto_splitter,
-                );
+                self.store_auto_splitter_settings();
+                let result = self
+                    .config
+                    .borrow_mut()
+                    .save_splits(&mut self.timer.write().unwrap());
                 crate::config::or_show_error(result);
                 if !self.timer.read().unwrap().run().has_been_modified() {
                     sender.input(AppMsg::ContinuePendingAction);
@@ -1033,6 +1031,9 @@ them.\n\nDiagnostic: {error}\n\nSee the application log and your distribution's 
             window.present();
             return;
         }
+        // The editor restores the auto splitter from its run when cancelled,
+        // so the run needs to reflect the live settings.
+        self.store_auto_splitter_settings();
         let run = self.timer.read().unwrap().run().clone();
         let Ok(editor) = livesplit_core::RunEditor::new(run) else {
             return;
@@ -1043,13 +1044,9 @@ them.\n\nDiagnostic: {error}\n\nSee the application log and your distribution's 
             editor.clone(),
             sender,
             #[cfg(feature = "auto-splitting")]
-            self.config.borrow().auto_splitter_association().cloned(),
-            #[cfg(feature = "auto-splitting")]
             self.auto_splitter.clone(),
             #[cfg(feature = "auto-splitting")]
             self.timer.clone(),
-            #[cfg(feature = "auto-splitting")]
-            self.config.borrow().splits_path().is_some(),
         );
         self.active_run_editor = Some(editor);
         self.open_editors.0.insert(EditorKind::Run, window.clone());
@@ -1077,6 +1074,16 @@ them.\n\nDiagnostic: {error}\n\nSee the application log and your distribution's 
             .0
             .insert(EditorKind::Layout, window.clone());
         window.present();
+    }
+
+    /// Writes the loaded auto splitter and its live settings into the run. When
+    /// none is loaded, the run's stored settings are left alone, as they may
+    /// belong to an auto splitter this timer can't run, like an ASL script.
+    fn store_auto_splitter_settings(&self) {
+        #[cfg(feature = "auto-splitting")]
+        if self.auto_splitter.loaded_path().is_some() {
+            self.auto_splitter.store_settings();
+        }
     }
 
     fn poll_world_records(&mut self, sender: &ComponentSender<Self>) {
