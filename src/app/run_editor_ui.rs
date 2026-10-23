@@ -147,7 +147,7 @@ pub(super) fn build_run_editor(
     #[cfg(feature = "auto-splitting")] auto_splitter: Rc<
         livesplit_core::auto_splitting::Runtime<SharedTimer>,
     >,
-    #[cfg(feature = "auto-splitting")] timer: SharedTimer,
+    timer: SharedTimer,
 ) -> adw::ApplicationWindow {
     let window = adw::ApplicationWindow::builder()
         .title("Edit Splits")
@@ -182,9 +182,17 @@ pub(super) fn build_run_editor(
         .unwrap()
         .state(&mut ImageCache::new(), livesplit_core::Lang::English);
     let details = build_run_details_page(&editor, &state);
+    // Set while the run's own game and category are matched against
+    // speedrun.com when the editor opens. That only loads suggestions and must
+    // not modify the run, so the handlers below don't touch the editor then.
+    let auto_selecting = Rc::new(Cell::new(false));
     let game = CompletionEntryRow::new("Game", &state.game);
     let game_editor = editor.clone();
+    let game_auto_selecting = auto_selecting.clone();
     game.connect_changed(move |row| {
+        if game_auto_selecting.get() {
+            return;
+        }
         if let Some(editor) = game_editor.borrow_mut().as_mut() {
             editor.set_game_name(row.text().as_str());
         }
@@ -195,7 +203,11 @@ pub(super) fn build_run_editor(
     game.add_suffix(&src_spinner);
     let category = CompletionEntryRow::new("Category", &state.category);
     let category_editor = editor.clone();
+    let category_auto_selecting = auto_selecting.clone();
     category.connect_changed(move |row| {
+        if category_auto_selecting.get() {
+            return;
+        }
         if let Some(editor) = category_editor.borrow_mut().as_mut() {
             editor.set_category_name(row.text().as_str());
         }
@@ -224,7 +236,11 @@ pub(super) fn build_run_editor(
     let search_auto_select_game = auto_select_game.clone();
     let search_auto_select_category = auto_select_category.clone();
     let search_initial_game = initial_game_name.clone();
+    let search_auto_selecting = auto_selecting.clone();
     game.connect_changed(move |row| {
+        if search_auto_selecting.get() {
+            return;
+        }
         let query = row.text().trim().to_owned();
         let generation = search_generation_changed.get() + 1;
         search_generation_changed.set(generation);
@@ -232,6 +248,7 @@ pub(super) fn build_run_editor(
         let auto_select_game = search_auto_select_game.clone();
         let auto_select_category = search_auto_select_category.clone();
         let initial_game = search_initial_game.clone();
+        let auto_selecting = search_auto_selecting.clone();
         glib::idle_add_local_once(move || completion.clear_items());
         if query.len() < 2 {
             search_spinner.set_spinning(false);
@@ -258,8 +275,15 @@ pub(super) fn build_run_editor(
                 );
             });
             glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
-                let Ok(response) = rx.try_recv() else {
-                    return glib::ControlFlow::Continue;
+                // A worker that died without answering is reported like a failed request.
+                let response = match rx.try_recv() {
+                    Ok(response) => response,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        return glib::ControlFlow::Continue
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        Err("the request stopped unexpectedly".to_owned())
+                    }
                 };
                 if generation_state.get() != generation {
                     return glib::ControlFlow::Break;
@@ -284,7 +308,12 @@ pub(super) fn build_run_editor(
                                 .position(|game| game.name.eq_ignore_ascii_case(&initial_game))
                             {
                                 auto_select_category.set(true);
+                                // Selecting replaces the entry's text with
+                                // speedrun.com's spelling, so restore it.
+                                auto_selecting.set(true);
                                 completion.select(index);
+                                completion.set_text(&initial_game);
+                                auto_selecting.set(false);
                             }
                         }
                         status
@@ -312,6 +341,7 @@ pub(super) fn build_run_editor(
     let selected_platform_completion = details.platform_entry.clone();
     let selected_region_completion = details.region_entry.clone();
     let selected_metadata_generation = metadata_generation.clone();
+    let selected_auto_selecting = auto_selecting.clone();
     game.connect_selected(move |selected_index| {
         if selected_populating.get() {
             return;
@@ -321,9 +351,11 @@ pub(super) fn build_run_editor(
         };
         let generation = selected_metadata_generation.get() + 1;
         selected_metadata_generation.set(generation);
-        selected_game_entry.set_text(&game.name);
-        if let Some(editor) = selected_editor.borrow_mut().as_mut() {
-            editor.set_game_name(game.name.as_str());
+        if !selected_auto_selecting.get() {
+            selected_game_entry.set_text(&game.name);
+            if let Some(editor) = selected_editor.borrow_mut().as_mut() {
+                editor.set_game_name(game.name.as_str());
+            }
         }
         selected_spinner.set_spinning(true);
         selected_status.set_tooltip_text(Some("Loading speedrun.com metadata…"));
@@ -351,9 +383,15 @@ pub(super) fn build_run_editor(
         let auto_category = selected_auto_category.clone();
         let initial_category = selected_initial_category.clone();
         let generation_state = selected_metadata_generation.clone();
+        let auto_selecting = selected_auto_selecting.clone();
         glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
-            let Ok(response) = rx.try_recv() else {
-                return glib::ControlFlow::Continue;
+            // A worker that died without answering is reported like a failed request.
+            let response = match rx.try_recv() {
+                Ok(response) => response,
+                Err(std::sync::mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Err("the request stopped unexpectedly".to_owned())
+                }
             };
             if generation_state.get() != generation {
                 return glib::ControlFlow::Break;
@@ -394,7 +432,10 @@ pub(super) fn build_run_editor(
                         if let Some(index) = categories.borrow().iter().position(|category| {
                             category.name.eq_ignore_ascii_case(&initial_category)
                         }) {
+                            auto_selecting.set(true);
                             category_completion.select(index);
+                            category_completion.set_text(&initial_category);
+                            auto_selecting.set(false);
                         }
                     }
                 }
@@ -456,9 +497,14 @@ pub(super) fn build_run_editor(
         };
         let generation = chosen_variable_generation.get() + 1;
         chosen_variable_generation.set(generation);
-        chosen_category_entry.set_text(&category.name);
-        if let Some(editor) = chosen_editor.borrow_mut().as_mut() {
-            editor.set_category_name(category.name.as_str());
+        // The run's own category only loads the variables for display. Its
+        // stored variables are only rewritten when the user picks a category.
+        let automatic = auto_selecting.get();
+        if !automatic {
+            chosen_category_entry.set_text(&category.name);
+            if let Some(editor) = chosen_editor.borrow_mut().as_mut() {
+                editor.set_category_name(category.name.as_str());
+            }
         }
         chosen_spinner.set_spinning(true);
         chosen_status.set_tooltip_text(Some("Loading speedrun.com category variables…"));
@@ -476,8 +522,13 @@ pub(super) fn build_run_editor(
         let variable_rows = chosen_variable_rows.clone();
         let generation_state = chosen_variable_generation.clone();
         glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
-            let Ok(response) = rx.try_recv() else {
-                return glib::ControlFlow::Continue;
+            // A worker that died without answering is reported like a failed request.
+            let response = match rx.try_recv() {
+                Ok(response) => response,
+                Err(std::sync::mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Err("the request stopped unexpectedly".to_owned())
+                }
             };
             if generation_state.get() != generation {
                 return glib::ControlFlow::Break;
@@ -485,7 +536,7 @@ pub(super) fn build_run_editor(
             spinner.set_spinning(false);
             match response {
                 Ok(variables) => {
-                    if let Some(editor) = editor.borrow_mut().as_mut() {
+                    if let Some(editor) = editor.borrow_mut().as_mut().filter(|_| !automatic) {
                         let old_variables = editor
                             .run()
                             .metadata()
@@ -900,7 +951,7 @@ pub(super) fn build_run_editor(
     let changed_on_apply = auto_splitter_changed.clone();
     #[cfg(feature = "auto-splitting")]
     let apply_runtime = auto_splitter.clone();
-    apply.connect_clicked(move |_| {
+    let apply_run = Rc::new(move || {
         if let Some(run) = apply_editor
             .borrow_mut()
             .take()
@@ -918,6 +969,44 @@ pub(super) fn build_run_editor(
             }
         }
         apply_window.close();
+    });
+    // Applying replaces the timer's run with the editor's copy, which resets
+    // the timer and drops anything recorded since the editor was opened. Timer
+    // controls are disabled meanwhile, but an auto splitter can still use it.
+    let initial_attempts = timer.read().unwrap().run().attempt_count();
+    let apply_timer = timer.clone();
+    let confirm_window = window.clone();
+    apply.connect_clicked(move |_| {
+        let timer_used = {
+            let timer = apply_timer.read().unwrap();
+            timer.current_phase() != livesplit_core::TimerPhase::NotRunning
+                || timer.run().attempt_count() != initial_attempts
+        };
+        if !timer_used {
+            apply_run();
+            return;
+        }
+        let dialog = gtk::AlertDialog::builder()
+            .message("Discard the latest attempt?")
+            .detail(
+                "The timer was used while the splits editor was open. Applying these changes \
+replaces the splits with the ones being edited, which discards that attempt.",
+            )
+            .modal(true)
+            .build();
+        dialog.set_buttons(&["Keep Editing", "Apply Anyway"]);
+        dialog.set_cancel_button(0);
+        dialog.set_default_button(0);
+        let apply_run = apply_run.clone();
+        dialog.choose(
+            Some(&confirm_window),
+            gio::Cancellable::NONE,
+            move |response| {
+                if response.ok() == Some(1) {
+                    apply_run();
+                }
+            },
+        );
     });
     let close_sender = sender.clone();
     #[cfg(feature = "auto-splitting")]

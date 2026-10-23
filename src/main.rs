@@ -14,7 +14,6 @@ mod setting_rows;
 mod speedrun_com;
 
 #[cfg(feature = "auto-splitting")]
-#[cfg(feature = "auto-splitting")]
 mod autosplitter_registry;
 
 fn main() {
