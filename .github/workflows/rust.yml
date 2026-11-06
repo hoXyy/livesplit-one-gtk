@@ -8,6 +8,12 @@ on:
       - 'dev'
     tags:
       - '*'
+    # Every push to main publishes an AppImage, which updaters then offer to users.
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - 'PKGBUILD'
+      - 'update-pkgver.sh'
 
 # The colors mess with the problem matcher.
 # env:
@@ -72,6 +78,78 @@ jobs:
           files: livesplit-one-*.*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  appimage:
+    # Pinned: this sets the oldest glibc, GTK and libadwaita the AppImage works with.
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    # A newer push cancels the older build, so an older build can't finish last and
+    # become the latest release.
+    concurrency:
+      group: appimage-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - name: Checkout Commit
+        uses: actions/checkout@v4
+        with:
+          # The commit count in the version needs the full history.
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: hecrj/setup-rust-action@v2
+        with:
+          rust-version: 'stable'
+
+      - name: Cache Cargo builds
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install --assume-yes libgtk-4-dev libadwaita-1-dev librsvg2-common adwaita-icon-theme dpkg-dev file pkg-config curl
+
+      - name: Determine version
+        id: version
+        run: |
+          cargo_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          echo "version=$cargo_version-r$(git rev-list --count HEAD)-g$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Build AppImage
+        run: bash packaging/appimage/build.sh
+        env:
+          # Every commit gets built, which is too often for max-opt's full LTO.
+          CARGO_PROFILE: release
+          VERSION: ${{ steps.version.outputs.version }}
+
+      - name: Upload AppImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: appimage
+          path: target/appimage/livesplit-one-gtk-*.AppImage
+
+      - name: Publish release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: v${{ steps.version.outputs.version }}
+        run: |
+          # Re-running a job for a commit that's already published changes nothing.
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            echo "$TAG is already published"
+            exit 0
+          fi
+          # --latest because GitHub otherwise goes by commit date, which a rebase can
+          # make older. The commit message is included because generated notes
+          # mostly list merged PRs.
+          gh release create "$TAG" \
+            target/appimage/livesplit-one-gtk-*.AppImage \
+            target/appimage/livesplit-one-gtk-*.AppImage.zsync \
+            --target "$GITHUB_SHA" \
+            --title "$TAG" \
+            --notes "$(git log -1 --format=%B)" \
+            --generate-notes \
+            --latest
 
   clippy:
     runs-on: ubuntu-latest
