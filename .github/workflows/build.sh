@@ -12,7 +12,7 @@ main() {
         FEATURE_FLAGS="--no-default-features --features $FEATURES"
     fi
 
-    cargo build --target "$TARGET" $release_flag $FEATURE_FLAGS
+    cargo build --locked --target "$TARGET" $release_flag $FEATURE_FLAGS
 }
 
 main

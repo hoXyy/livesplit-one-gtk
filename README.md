@@ -20,6 +20,16 @@ cargo build --release --locked
 cargo test --all-features
 ```
 
+### AppImage
+
+Every push to `main` publishes an AppImage on the
+[releases page](https://github.com/hoXyy/livesplit-one-gtk/releases). Updaters that
+read AppImage update information, such as Gear Lever, can find new builds on their own.
+
+To build one yourself, run `packaging/appimage/build.sh` on Ubuntu 24.04, or in a
+container of it. The script lists the packages it needs, and the result ends up in
+`target/appimage`.
+
 ## A note about global hotkeys on Wayland
 
 On Wayland, LiveSplit's global hotkeys use Linux evdev input devices so that
@@ -75,6 +85,10 @@ Autosplitters may require `CAP_SYS_PTRACE` to be able to read other processes's 
 ```bash
 sudo setcap CAP_SYS_PTRACE=+eip /usr/bin/livesplit-one-gtk
 ```
+
+This doesn't work with the AppImage, because capabilities can't be set on a binary
+inside it. The AppImage has to rely on what the system's `kernel.yama.ptrace_scope`
+setting allows instead.
 
 # Official versions of LiveSplit One
 

@@ -2,7 +2,7 @@
 
 pkgname=livesplit-one-gtk-git
 _pkgname=livesplit-one-gtk
-pkgver=0.7.2.r169.g4ba9d64
+pkgver=0.7.2.r180.gc1f7a78
 pkgrel=1
 pkgdesc="Linux desktop version of LiveSplit One using GTK4 and libadwaita"
 arch=('x86_64')
@@ -24,7 +24,7 @@ conflicts=('livesplit-one-gtk')
 # GCC LTO objects produced by native Rust dependencies (such as mimalloc,
 # ring, and wasmtime) cannot be consumed by Cargo's final LLD link.
 options=('!lto')
-source=("${_pkgname}::git+${url}.git#branch=dev")
+source=("${_pkgname}::git+${url}.git#branch=main")
 sha256sums=('SKIP')
 
 pkgver() {
@@ -61,14 +61,14 @@ check() {
 package() {
   cd "${_pkgname}"
 
-  install -Dm755 target/release/livesplit-one \
+  install -Dm755 target/release/livesplit-one-gtk \
     "${pkgdir}/usr/bin/livesplit-one-gtk"
-  install -Dm644 packaging/livesplit-one-gtk.desktop \
-    "${pkgdir}/usr/share/applications/livesplit-one-gtk.desktop"
+  install -Dm644 packaging/org.livesplit.LiveSplitOne.desktop \
+    "${pkgdir}/usr/share/applications/org.livesplit.LiveSplitOne.desktop"
   install -Dm644 icons/icon.svg \
-    "${pkgdir}/usr/share/icons/hicolor/scalable/apps/livesplit-one-gtk.svg"
+    "${pkgdir}/usr/share/icons/hicolor/scalable/apps/org.livesplit.LiveSplitOne.svg"
   install -Dm644 icons/icon.png \
-    "${pkgdir}/usr/share/pixmaps/livesplit-one-gtk.png"
+    "${pkgdir}/usr/share/pixmaps/org.livesplit.LiveSplitOne.png"
   install -Dm644 README.md \
     "${pkgdir}/usr/share/doc/${pkgname}/README.md"
   install -Dm644 LICENSE \
