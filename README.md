@@ -76,6 +76,29 @@ Or add it to your system flake:
 
 An overlay is also available as `livesplit-one-gtk.overlays.default`.
 
+### Letting autosplitters read game memory on NixOS
+
+The `setcap` command [below](#note-about-autosplitters) doesn't work on files in the
+Nix store. Instead, add a security wrapper that gives LiveSplit `CAP_SYS_PTRACE`:
+
+```nix
+security.wrappers.livesplit-one-gtk = {
+  source = lib.getExe livesplit-one-gtk; # the package from one of the snippets above
+  owner = "root";
+  group = "root";
+  capabilities = "cap_sys_ptrace+p";
+};
+```
+
+The wrapper is installed as `/run/wrappers/bin/livesplit-one-gtk`, which comes first
+on `PATH`, so the desktop entry and the `livesplit-one-gtk` command both go through
+it. Only LiveSplit (and anything it starts) gets the capability. Autosplitters then
+work with any `kernel.yama.ptrace_scope` setting except 3, which blocks memory
+access for everyone.
+
+> **Security note:** With the wrapper, autosplitters can read the memory of every
+> process running as your account, not just the game.
+
 ## Build requirements
 
 - Rust stable
