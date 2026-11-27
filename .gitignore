@@ -1,3 +1,5 @@
 /target
 /*.src.rpm
 /*.tar.gz
+result
+result-*
