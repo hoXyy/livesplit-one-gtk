@@ -5,6 +5,76 @@ and [livesplit-core](https://github.com/LiveSplit/livesplit-core). Based on [Ale
 
 Available as a package:
 - AUR: [livesplit-one-gtk-git](https://aur.archlinux.org/packages/livesplit-one-gtk-git)
+- Nix: see [below](#nix)
+
+## Nix
+
+The package builds from source, from the `main` branch.
+
+### Without flakes
+
+Install it into your user profile:
+
+```bash
+nix-env -if https://github.com/hoXyy/livesplit-one-gtk/archive/main.tar.gz
+```
+
+Or add it to your NixOS (or Home Manager) configuration:
+
+```nix
+{ pkgs, ... }:
+let
+  livesplit-one-gtk = import (builtins.fetchTarball
+    "https://github.com/hoXyy/livesplit-one-gtk/archive/main.tar.gz") { };
+in
+{
+  environment.systemPackages = [ livesplit-one-gtk ];
+  # Home Manager: home.packages = [ livesplit-one-gtk ];
+}
+```
+
+This builds against the nixpkgs revision pinned in this repository's `flake.lock`,
+so it works whatever channel you're on. To build against your own nixpkgs instead,
+use `import (...) { inherit pkgs; }`. That needs a channel whose Rust is new enough for
+the dependencies (currently nixos-unstable).
+
+From a clone of this repository, `nix-build` builds it into `./result`.
+
+### With flakes
+
+Run it without installing:
+
+```bash
+nix run github:hoXyy/livesplit-one-gtk
+```
+
+Install it into your user profile:
+
+```bash
+nix profile install github:hoXyy/livesplit-one-gtk
+```
+
+Or add it to your system flake:
+
+```nix
+{
+  inputs.livesplit-one-gtk.url = "github:hoXyy/livesplit-one-gtk";
+
+  outputs = { nixpkgs, livesplit-one-gtk, ... }: {
+    nixosConfigurations.<hostname> = nixpkgs.lib.nixosSystem {
+      modules = [
+        ({ pkgs, ... }: {
+          environment.systemPackages = [
+            livesplit-one-gtk.packages.${pkgs.stdenv.hostPlatform.system}.default
+          ];
+        })
+      ];
+    };
+  };
+}
+```
+
+An overlay is also available as `livesplit-one-gtk.overlays.default`.
 
 ## Build requirements
 
